@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - override /optimization: bridge
+  - override /task: pusht_keypoint
+  - override /network: mlp
+
+task:
+  horizon: 32 # W = H(16) + K(16)
+  act_steps: 1 # Closed-loop execution: execute 1 step then replan
+
+log:
+  exp_name: "pusht_bridge_streaming"

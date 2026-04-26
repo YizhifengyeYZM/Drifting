@@ -1,0 +1,10 @@
+defaults:
+  - default  # 继承同目录下的 default.yaml
+  - _self_   # 允许当前文件的内容覆盖默认值
+
+# @package optimization
+loss_type: bridge
+loss_scale: 1.0 # 通常 Flow Matching 不需要太大的 Scale，或者根据需要调整
+prediction_offset: 16
+sample_mode: streaming
+num_steps: 16 # 这里的 num_steps 对于 bridge streaming 来说，是用于计算 dt = 1/K 的参考，或者是 open-loop 时的步数

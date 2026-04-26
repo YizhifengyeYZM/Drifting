@@ -1,0 +1,73 @@
+# @package optimization
+defaults:
+  - _self_
+
+seed: 0
+loss_type: "flow"
+loss_scale: 0.1
+norm_type: "l2" # "l1", "l2", "smooth_l1"
+lr: 1e-4
+weight_decay: 1e-5
+num_steps: 1
+sample_mode: "zero"
+
+# Naive Drifting baseline.
+# Defaults follow the DP-based Drifting adaptation: 8 samples per label,
+# per-timestep raw-action drifting loss, and official JAX temperatures.
+naive_drift_gen_per_label: 8
+naive_drift_temperatures: [0.02, 0.05, 0.2]
+naive_drift_per_timestep_loss: true
+naive_drift_loss_scale: 1.0
+
+# Diffusion Policy / DDPM baseline.
+# Defaults match the official DP scheduler and 100-NFE evaluation.
+dp_num_train_timesteps: 100
+dp_num_inference_steps: 100
+dp_beta_schedule: "squaredcos_cap_v2"
+dp_beta_start: 0.0001
+dp_beta_end: 0.02
+dp_prediction_type: "epsilon"
+dp_clip_sample: true
+dp_loss_scale: 1.0
+dp_timestep_scale: "raw" # "raw" uses 0..99, "normalized" uses 0..1
+
+t_two_step: 0.9
+discrete_dt: 0.01
+grad_clip_norm: 10.0
+ema_rate: 0.995
+batch_size: 1024
+gradient_steps: 300000
+warmup_ratio: 0.2
+rampup_ratio: 0.5
+min_value: 0.0
+max_value: 1.0
+model_path: null
+interp_type: "linear"
+device: "cuda"
+use_compile: false
+compile_mode: null # Compile mode: null, "default", "reduce-overhead", "max-autotune"
+use_cudagraphs: false # Whether to use CUDA graphs (requires static shapes)
+auto_resume: true
+p_uncond: 0.0 # The unconditional probability for the bridge policy v2
+guidance_scale: 1.0 # The guidance scale for the bridge policy v2
+use_consistency_loss: false ##!! BPv3 的辅助 loss
+consist_beta: 1.0 ##!! BPv3 的辅助 loss 的权重
+
+# runtime-synced from task config in main()
+policy_horizon: null
+roll_chunk_horizon: null
+obs_steps: null
+act_steps: null
+act_dim: null
+
+# RPv1 specific configs
+rolling_tau_min: 1e-3
+rolling_tau_max: 0.05
+rolling_tau_mode: "linear"   # or "exp"
+rolling_tau_beta: 2.0
+
+rolling_noise_type: "gaussian"      # train
+rolling_noise_rho: 0.9
+
+rolling_noise_type_eval: "gaussian" # eval
+rolling_noise_rho_eval: 0.9
