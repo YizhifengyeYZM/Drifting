@@ -45,6 +45,16 @@ class OptimizationConfig:
     dp_clip_sample: bool = True
     dp_loss_scale: float = 1.0
     dp_timestep_scale: str = "raw"  # "raw" or "normalized"
+    mp1_flow_ratio: float = 0.5
+    mp1_time_dist: str = "lognorm"  # "lognorm" or "uniform"
+    mp1_lognorm_mu: float = -0.4
+    mp1_lognorm_sigma: float = 1.0
+    mp1_cfg_scale: float = 2.0
+    mp1_use_cfg_target: bool = True
+    mp1_adaptive_gamma: float = 0.5
+    mp1_adaptive_c: float = 1e-3
+    mp1_noise_scale: float = 1.0
+    mp1_loss_scale: float = 1.0
     t_two_step: float = 0.9
     discrete_dt: float = 0.01
     grad_clip_norm: float = 10.0

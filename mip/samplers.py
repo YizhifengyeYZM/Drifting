@@ -19,6 +19,7 @@ from mip.losses import (
     dp_get_schedule,
     dp_model_timestep,
     generate_ou_noise,
+    mp1_interval_velocity,
 )
 
 
@@ -28,6 +29,8 @@ def get_default_step_list(loss_type: str):
     elif loss_type == "bridge":
         return [16]
     elif loss_type in ["regression", "mip", "tsd", "straight_flow"]:
+        return [1]
+    elif loss_type == "mp1":
         return [1]
     elif loss_type in ["dp", "ddpm"]:
         return [100]
@@ -89,6 +92,8 @@ def get_default_step_list(loss_type: str):
         return [1]
     elif loss_type == "drift6min_rebal":
         return [1]
+    elif loss_type == "idp":
+        return [1]
     else:
         raise NotImplementedError(f"Loss type {loss_type} not implemented.")
 
@@ -102,6 +107,8 @@ def get_sampler(loss_type: str):
         return mip_sampler
     elif loss_type in ["dp", "ddpm"]:
         return dp_sampler
+    elif loss_type == "mp1":
+        return mp1_sampler
     elif loss_type == "naive_drift":
         return naive_drift_sampler
     elif loss_type in ["lmd", "ctm", "psd", "lsd", "esd", "mf"]:
@@ -164,9 +171,30 @@ def get_sampler(loss_type: str):
         return drifting_policy_sampler4
     elif loss_type == "drift6min_rebal":
         return drifting_policy_sampler4
+    elif loss_type == "idp":
+        return implicit_drifting_sampler
     else:
         raise NotImplementedError(f"Loss type {loss_type} not implemented.")
 
+
+def implicit_drifting_sampler(
+    config,
+    flow_map,
+    encoder,
+    act_0: torch.Tensor,
+    obs: torch.Tensor,
+):
+    """
+    Drifting Policy sampler.
+    Deployment is strictly one-step.
+    """
+    bs = act_0.shape[0]
+    s = torch.zeros((bs,), device=act_0.device)
+
+    obs_emb = encoder(obs, None)
+    act_in = torch.zeros_like(act_0, device=act_0.device)
+    act_pred_0 = flow_map.get_velocity(s, act_in, obs_emb)
+    return act_pred_0
 
 def ode_sampler(
     config: OptimizationConfig,
@@ -304,6 +332,24 @@ def dp_sampler(
         )
 
     return sample
+
+
+def mp1_sampler(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    act_0: torch.Tensor,
+    obs: torch.Tensor,
+):
+    """MP1 one-step sampler: x_0 = x_1 - u_theta(x_1, r=0, t=1 | obs)."""
+    batch_size = act_0.shape[0]
+    obs_emb = encoder(obs, None)
+    noise_scale = float(getattr(config, "mp1_noise_scale", 1.0))
+    act_t = torch.randn_like(act_0, device=act_0.device) * noise_scale
+    r = torch.zeros((batch_size,), device=act_0.device, dtype=act_0.dtype)
+    t = torch.ones((batch_size,), device=act_0.device, dtype=act_0.dtype)
+    u = mp1_interval_velocity(flow_map, act_t, r, t, obs_emb)
+    return act_t - u
 
 
 def naive_drift_sampler(

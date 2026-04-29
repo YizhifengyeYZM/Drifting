@@ -1,6 +1,7 @@
 """Losses for iterative policy training."""
 
 from collections.abc import Callable
+from contextlib import nullcontext
 
 import torch
 import numpy as np
@@ -27,6 +28,302 @@ def get_norm(x: torch.Tensor, norm_type: str) -> torch.Tensor:
         )
     else:
         raise NotImplementedError(f"Norm type {norm_type} not implemented.")
+
+def get_loss_fn(loss_type: str) -> Callable:
+    if loss_type == "flow":
+        return flow_loss
+    elif loss_type == "regression":
+        return regression_loss
+    elif loss_type == "straight_flow":
+        return straight_flow_loss
+    elif loss_type == "tsd":
+        return tsd_loss
+    elif loss_type == "mip":
+        return mip_loss
+    elif loss_type == "lmd":
+        return lmd_loss
+    elif loss_type == "ctm":
+        return ctm_loss
+    elif loss_type == "psd":
+        return psd_loss
+    elif loss_type == "lsd":
+        return lsd_loss
+    elif loss_type == "esd":
+        return esd_loss
+    elif loss_type == "mf":
+        return mf_loss
+    elif loss_type == "mp1":
+        return mp1_loss
+    elif loss_type == "bridge":
+        return bridge_loss
+    elif loss_type == "bridge_v2":
+        return bridge_v2_loss03092
+    elif loss_type == "bridge_v3":
+        return bridge_v3_loss
+    elif loss_type == "prcp_v1":
+        return prcp_v1_loss
+    elif loss_type == "prcp_v2":
+        return prcp_v2_loss
+    elif loss_type == "rp_v1":
+        return rolling_policy_v1_loss
+    elif loss_type in ["dp", "ddpm"]:
+        return dp_loss
+    elif loss_type == "naive_drift":
+        return naive_drift_loss
+    elif loss_type == "drifting":
+        return drifting_policy_loss
+    elif loss_type == "drifting2":
+        return drifting_policy_loss2
+    elif loss_type == "drifting3":
+        return drifting_policy_loss3
+    elif loss_type == "drifting4":
+        return drifting_policy_loss4
+    elif loss_type == "drifting5":
+        return drifting_policy_loss5
+    elif loss_type == "drifting6":
+        return drifting_policy_loss6
+    elif loss_type == "globaldiag":
+        return globaldiag_policy_loss
+    elif loss_type == "arl":
+        return arl_policy_loss
+    elif loss_type == "geofuse":
+        return geofuse_policy_loss
+    elif loss_type == "geofuse_noise":
+        return geofuse_noise_loss
+    elif loss_type == "geofuse_align":
+        return geofuse_align_loss
+    elif loss_type == "drifting7":
+        return drifting_policy_loss7
+    elif loss_type == "drifting8":
+        return drifting_policy_loss8
+    elif loss_type == "drifting9":
+        return drifting_policy_loss9
+    elif loss_type == "drifting10":
+        return drifting_policy_loss10
+    elif loss_type == "drifting11":
+        return drifting_policy_loss11
+    elif loss_type == "drifting12":
+        return drifting_policy_loss12
+    elif loss_type == "drifting13":
+        return drifting_policy_loss13
+    elif loss_type == "drifting14":
+        return drifting_policy_loss14
+    elif loss_type == "drift6min":
+        return drift6min_loss
+    elif loss_type == "drift6matrix":
+        return drift6matrix_loss
+    elif loss_type == "drift6min_awshort":
+        return drift6min_awshort_loss
+    elif loss_type == "drift6min_rebal":
+        return drift6min_rebal_loss
+    elif loss_type == "idp":
+        return implicit_drifting_loss
+    else:
+        raise NotImplementedError(f"Loss type {loss_type} not implemented.")
+
+
+def _metricdrift_build_conditional_weights(
+    obs_emb: torch.Tensor,
+    act_flat: torch.Tensor,
+    eps: float = 1e-6,
+):
+    """
+    Build the same observation-conditioned soft neighborhood used by Drift6,
+    but compute diagnostics without materializing B x B x D tensors.
+    """
+    B = act_flat.shape[0]
+    device = act_flat.device
+
+    obs_feat = obs_emb.reshape(B, -1).detach()
+    obs_feat = F.normalize(obs_feat, dim=-1, eps=eps)
+
+    sim = obs_feat @ obs_feat.transpose(0, 1)
+    sim_mean = sim.mean(dim=1, keepdim=True)
+    sim_std = sim.std(dim=1, keepdim=True, unbiased=False).clamp_min(eps)
+    logits = (sim - sim_mean) / sim_std
+    weights = logits.softmax(dim=1)
+
+    n_eff = 1.0 / weights.pow(2).sum(dim=1).clamp_min(1e-12)
+    top1_mass = weights.max(dim=1).values
+    top5_mass = weights.topk(min(5, B), dim=1).values.sum(dim=1)
+    top10_mass = weights.topk(min(10, B), dim=1).values.sum(dim=1)
+
+    eye_mask = torch.eye(B, device=device, dtype=torch.bool)
+    sim_nonself = sim.masked_fill(eye_mask, -1e9)
+    max_nonself = sim_nonself.max(dim=1).values
+    self_next_margin = sim.diagonal() - max_nonself
+
+    act_sq = act_flat.pow(2).sum(dim=-1, keepdim=True)
+    pair_sqdist = (act_sq + act_sq.transpose(0, 1) - 2.0 * (act_flat @ act_flat.transpose(0, 1))).clamp_min(0.0)
+    pair_l2 = pair_sqdist.sqrt()
+    neighbor_radius_l2 = (weights * pair_l2).sum(dim=1)
+
+    stats = {
+        "w_self_mean": weights.diagonal().mean().detach(),
+        "n_eff_mean": n_eff.mean().detach(),
+        "top1_mass_mean": top1_mass.mean().detach(),
+        "top5_mass_mean": top5_mass.mean().detach(),
+        "top10_mass_mean": top10_mass.mean().detach(),
+        "self_next_margin_mean": self_next_margin.mean().detach(),
+        "neighbor_radius_l2_mean": neighbor_radius_l2.mean().detach(),
+    }
+    return weights, stats
+
+def _metricdrift_build_diag_metric(
+    weights: torch.Tensor,
+    act_flat: torch.Tensor,
+    eps: float = 1e-6,
+):
+    """
+    Minimal version:
+    sample-specific local diagonal precision minus task-global diagonal baseline.
+    """
+    second_diag = weights @ act_flat.pow(2)
+    local_mean = weights @ act_flat
+    local_var = (second_diag - 2.0 * local_mean * act_flat + act_flat.pow(2)).clamp_min(eps)
+
+    global_mean = act_flat.mean(dim=0, keepdim=True)
+    global_var = (act_flat - global_mean).pow(2).mean(dim=0).clamp_min(eps)
+
+    local_var_mean = local_var.mean(dim=-1, keepdim=True).clamp_min(eps)
+    global_var_mean = global_var.mean().clamp_min(eps)
+
+    local_scale = torch.sqrt(local_var_mean / (local_var + eps))
+    local_scale = local_scale / local_scale.mean(dim=-1, keepdim=True).clamp_min(eps)
+
+    global_scale = torch.sqrt(global_var_mean / (global_var + eps))
+    global_scale = global_scale / global_scale.mean().clamp_min(eps)
+
+    metric_excess = F.relu(
+        local_scale / global_scale.unsqueeze(0).clamp_min(eps) - 1.0
+    ).detach()
+    metric_diag = (1.0 + metric_excess).detach()
+
+    stats = {
+        "local_var_mean": local_var.mean().detach(),
+        "global_var_mean": global_var.mean().detach(),
+        "local_scale_min_mean": local_scale.min(dim=-1).values.mean().detach(),
+        "local_scale_max_mean": local_scale.max(dim=-1).values.mean().detach(),
+        "global_scale_min": global_scale.min().detach(),
+        "global_scale_max": global_scale.max().detach(),
+        "metric_excess_mean": metric_excess.mean().detach(),
+        "metric_excess_max_mean": metric_excess.max(dim=-1).values.mean().detach(),
+        "metric_excess_active_frac": (metric_excess > 0).float().mean().detach(),
+    }
+    return metric_diag, stats
+
+def _idp_build_batch(
+    config,
+    flow_map,
+    encoder,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+):
+    if config.norm_type != "l2":
+        raise NotImplementedError("IDP variants currently require norm_type='l2'.")
+
+    t_star = config.t_two_step
+    loss_scale = config.loss_scale
+    eps = 1e-6
+
+    B = act.shape[0]
+    D = act[0].numel()
+    device = act.device
+
+    s = torch.zeros_like(delta_t, device=delta_t.device)
+    t = torch.zeros_like(delta_t, device=delta_t.device) + t_star
+
+    act_0 = torch.zeros_like(act, device=device)
+    noise = torch.empty_like(act).normal_(0, 1)
+
+    obs_emb = encoder(obs, None)
+    act_pred_0 = flow_map.get_velocity(s, act_0, obs_emb)
+
+    act_t = act + (1 - t_star) * noise
+    act_pred_1 = flow_map.get_velocity(t, act_t, obs_emb)
+
+    act_flat = act.reshape(B, D).detach()
+    weights, weight_stats = _metricdrift_build_conditional_weights(
+        obs_emb, act_flat, eps=eps
+    )
+    metric_diag, metric_stats = _metricdrift_build_diag_metric(weights, act_flat, eps=eps)
+
+    coarse_res_flat = (act_pred_0 - act).reshape(B, D)
+    short_res_flat = (act_pred_1 - act).reshape(B, D)
+
+    coarse_loss_i = (metric_diag * coarse_res_flat.pow(2)).sum(dim=-1) / (t_star * t_star)
+    short_loss_i = (metric_diag * short_res_flat.pow(2)).sum(dim=-1) / (
+        (1 - t_star) * (1 - t_star)
+    )
+
+    coarse_flat = act_pred_0.reshape(B, D).detach()
+    short_flat = act_pred_1.reshape(B, D).detach()
+    proposal_to_gt_l2 = (coarse_flat - act_flat).norm(dim=-1)
+    short_to_gt_l2 = (short_flat - act_flat).norm(dim=-1)
+    correction_step = short_flat - coarse_flat
+    direct_gt = act_flat - coarse_flat
+    correction_progress = (
+        proposal_to_gt_l2 - short_to_gt_l2
+    ) / proposal_to_gt_l2.clamp_min(eps)
+    correction_align = F.cosine_similarity(
+        correction_step, direct_gt, dim=-1, eps=eps
+    )
+
+    aux = {
+        "proposal_to_gt_l2_mean": float(proposal_to_gt_l2.mean().detach()),
+        "coarse_to_gt_l2_mean": float(proposal_to_gt_l2.mean().detach()),
+        "short_to_gt_l2_mean": float(short_to_gt_l2.mean().detach()),
+        "correction_progress_mean": float(correction_progress.mean().detach()),
+        "correction_align_cos_mean": float(correction_align.mean().detach()),
+        "correction_better_frac": float(
+            (short_to_gt_l2 < proposal_to_gt_l2).float().mean().detach()
+        ),
+    }
+    aux.update({k: float(v) for k, v in weight_stats.items()})
+    aux.update({k: float(v) for k, v in metric_stats.items()})
+
+    return {
+        "loss_scale": loss_scale,
+        "coarse_loss_i": coarse_loss_i,
+        "short_loss_i": short_loss_i,
+        "correction_progress": correction_progress.detach(),
+        "aux": aux,
+    }
+
+
+def implicit_drifting_loss(
+    config,
+    flow_map,
+    encoder,
+    interp,      # kept only for interface compatibility
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+):
+    """
+    Implicit Drifting Policy:
+    rewritten as a conditional diagonal contraction metric over the
+    one-step proposal, with task-global diagonal anisotropy removed first.
+    """
+    del interp
+    batch = _idp_build_batch(
+        config, flow_map, encoder, act, obs, delta_t
+    )
+    loss_coarse = torch.mean(batch["coarse_loss_i"])
+    loss_short = torch.mean(batch["short_loss_i"])
+    loss = batch["loss_scale"] * (loss_coarse + loss_short)
+
+    aux = batch["aux"].copy()
+    aux.update(
+        {
+            "loss_coarse": float(loss_coarse.detach()),
+            "loss_short": float(loss_short.detach()),
+        }
+    )
+    return loss, aux
+
+
 
 
 def _naive_drift_cdist(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8):
@@ -256,95 +553,6 @@ def dp_ddpm_step(
     return pred_prev_sample + nonzero_mask * torch.sqrt(torch.clamp(variance, min=1e-20)) * noise
 
 
-def get_loss_fn(loss_type: str) -> Callable:
-    if loss_type == "flow":
-        return flow_loss
-    elif loss_type == "regression":
-        return regression_loss
-    elif loss_type == "straight_flow":
-        return straight_flow_loss
-    elif loss_type == "tsd":
-        return tsd_loss
-    elif loss_type == "mip":
-        return mip_loss
-    elif loss_type == "lmd":
-        return lmd_loss
-    elif loss_type == "ctm":
-        return ctm_loss
-    elif loss_type == "psd":
-        return psd_loss
-    elif loss_type == "lsd":
-        return lsd_loss
-    elif loss_type == "esd":
-        return esd_loss
-    elif loss_type == "mf":
-        return mf_loss
-    elif loss_type == "bridge":
-        return bridge_loss
-    elif loss_type == "bridge_v2":
-        return bridge_v2_loss03092
-    elif loss_type == "bridge_v3":
-        return bridge_v3_loss
-    elif loss_type == "prcp_v1":
-        return prcp_v1_loss
-    elif loss_type == "prcp_v2":
-        return prcp_v2_loss
-    elif loss_type == "rp_v1":
-        return rolling_policy_v1_loss
-    elif loss_type in ["dp", "ddpm"]:
-        return dp_loss
-    elif loss_type == "naive_drift":
-        return naive_drift_loss
-    elif loss_type == "drifting":
-        return drifting_policy_loss
-    elif loss_type == "drifting2":
-        return drifting_policy_loss2
-    elif loss_type == "drifting3":
-        return drifting_policy_loss3
-    elif loss_type == "drifting4":
-        return drifting_policy_loss4
-    elif loss_type == "drifting5":
-        return drifting_policy_loss5
-    elif loss_type == "drifting6":
-        return drifting_policy_loss6
-    elif loss_type == "globaldiag":
-        return globaldiag_policy_loss
-    elif loss_type == "arl":
-        return arl_policy_loss
-    elif loss_type == "geofuse":
-        return geofuse_policy_loss
-    elif loss_type == "geofuse_noise":
-        return geofuse_noise_loss
-    elif loss_type == "geofuse_align":
-        return geofuse_align_loss
-    elif loss_type == "drifting7":
-        return drifting_policy_loss7
-    elif loss_type == "drifting8":
-        return drifting_policy_loss8
-    elif loss_type == "drifting9":
-        return drifting_policy_loss9
-    elif loss_type == "drifting10":
-        return drifting_policy_loss10
-    elif loss_type == "drifting11":
-        return drifting_policy_loss11
-    elif loss_type == "drifting12":
-        return drifting_policy_loss12
-    elif loss_type == "drifting13":
-        return drifting_policy_loss13
-    elif loss_type == "drifting14":
-        return drifting_policy_loss14
-    elif loss_type == "drift6min":
-        return drift6min_loss
-    elif loss_type == "drift6matrix":
-        return drift6matrix_loss
-    elif loss_type == "drift6min_awshort":
-        return drift6min_awshort_loss
-    elif loss_type == "drift6min_rebal":
-        return drift6min_rebal_loss
-    else:
-        raise NotImplementedError(f"Loss type {loss_type} not implemented.")
-
-
 def flow_loss(
     config: OptimizationConfig,
     flow_map: FlowMap,
@@ -482,6 +690,132 @@ def dp_loss(
         "dp_mse": raw_loss.detach(),
         "dp_timestep_mean": timesteps.float().mean().detach(),
         "dp_loss_scale": torch.as_tensor(loss_scale, device=act.device, dtype=act.dtype),
+    }
+
+
+def mp1_interval_velocity(
+    flow_map: FlowMap,
+    act_t: torch.Tensor,
+    r: torch.Tensor,
+    t: torch.Tensor,
+    obs_emb: torch.Tensor,
+) -> torch.Tensor:
+    """Return MP1 interval-average velocity u_theta(x_t, r, t | obs)."""
+    velocity, _ = flow_map.net(act_t, r, t, obs_emb)
+    return velocity
+
+
+def _mp1_attention_context():
+    """Force math SDPA during MP1 JVP; flash attention lacks forward AD support."""
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        return sdpa_kernel(SDPBackend.MATH)
+    except Exception:
+        return nullcontext()
+
+
+def _mp1_adaptive_l2_loss(
+    error: torch.Tensor,
+    gamma: float = 0.5,
+    c: float = 1e-3,
+) -> torch.Tensor:
+    """MP1 adaptive L2: stopgrad(weight) * mean(error^2)."""
+    delta_sq = error.pow(2).mean(dim=tuple(range(1, error.ndim)))
+    weight = 1.0 / torch.clamp(delta_sq + c, min=1e-12).pow(1.0 - gamma)
+    return (weight.detach() * delta_sq).mean()
+
+
+def _mp1_sample_r_t(
+    config: OptimizationConfig,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    time_dist = str(getattr(config, "mp1_time_dist", "lognorm"))
+    if time_dist == "uniform":
+        samples = torch.rand(batch_size, 2, device=device, dtype=dtype)
+    elif time_dist == "lognorm":
+        mu = float(getattr(config, "mp1_lognorm_mu", -0.4))
+        sigma = float(getattr(config, "mp1_lognorm_sigma", 1.0))
+        samples = torch.sigmoid(
+            torch.randn(batch_size, 2, device=device, dtype=dtype) * sigma + mu
+        )
+    else:
+        raise NotImplementedError(f"MP1 time distribution {time_dist} not implemented.")
+
+    t = torch.maximum(samples[:, 0], samples[:, 1])
+    r = torch.minimum(samples[:, 0], samples[:, 1])
+
+    flow_ratio = float(getattr(config, "mp1_flow_ratio", 0.5))
+    flow_ratio = min(max(flow_ratio, 0.0), 1.0)
+    num_flow = int(flow_ratio * batch_size)
+    if num_flow > 0:
+        idx = torch.randperm(batch_size, device=device)[:num_flow]
+        r[idx] = t[idx]
+    return r, t
+
+
+def mp1_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """MP1/MeanFlow policy loss without the hidden-feature dispersive term."""
+    del interp, delta_t
+    batch_size = act.shape[0]
+    obs_emb = encoder(obs, None)
+
+    r, t = _mp1_sample_r_t(config, batch_size, act.device, act.dtype)
+    r_expanded = r.view(batch_size, *((1,) * (act.ndim - 1)))
+    t_expanded = t.view(batch_size, *((1,) * (act.ndim - 1)))
+
+    noise_scale = float(getattr(config, "mp1_noise_scale", 1.0))
+    noise = torch.randn_like(act) * noise_scale
+    act_t = (1.0 - t_expanded) * act + t_expanded * noise
+    v = noise - act
+
+    cfg_scale = float(getattr(config, "mp1_cfg_scale", 2.0))
+    use_cfg_target = bool(getattr(config, "mp1_use_cfg_target", True))
+    if use_cfg_target:
+        with torch.no_grad():
+            u_t = mp1_interval_velocity(flow_map, act_t, t, t, obs_emb)
+        v_hat = cfg_scale * v + (1.0 - cfg_scale) * u_t
+    else:
+        v_hat = v
+
+    def model_wrapped(x_in, t_in, r_in):
+        with _mp1_attention_context():
+            return mp1_interval_velocity(flow_map, x_in, r_in, t_in, obs_emb)
+
+    u, dudt = torch.func.jvp(
+        model_wrapped,
+        (act_t, t, r),
+        (v_hat, torch.ones_like(t), torch.zeros_like(r)),
+    )
+
+    u_tgt = v_hat - (t_expanded - r_expanded) * dudt
+    error = u - u_tgt.detach()
+
+    gamma = float(getattr(config, "mp1_adaptive_gamma", 0.5))
+    c = float(getattr(config, "mp1_adaptive_c", 1e-3))
+    raw_loss = _mp1_adaptive_l2_loss(error, gamma=gamma, c=c)
+    loss_scale = float(getattr(config, "mp1_loss_scale", 1.0))
+    loss = loss_scale * raw_loss
+
+    mse = error.detach().pow(2).mean()
+    return loss, {
+        "mp1_loss": raw_loss.detach(),
+        "mp1_mse": mse,
+        "mp1_t_mean": t.detach().mean(),
+        "mp1_r_mean": r.detach().mean(),
+        "mp1_flow_frac": (r == t).to(act.dtype).mean().detach(),
+        "mp1_cfg_scale": torch.as_tensor(cfg_scale, device=act.device, dtype=act.dtype),
+        "mp1_loss_scale": torch.as_tensor(loss_scale, device=act.device, dtype=act.dtype),
     }
 
 
