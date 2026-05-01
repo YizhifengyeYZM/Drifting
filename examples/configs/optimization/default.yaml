@@ -31,6 +31,48 @@ dp_clip_sample: true
 dp_loss_scale: 1.0
 dp_timestep_scale: "raw" # "raw" uses 0..99, "normalized" uses 0..1
 
+# EDM teacher baseline for Consistency Policy.
+# Defaults follow the CP/Karras EDM setup.
+edm_sigma_min: 0.02
+edm_sigma_max: 80.0
+edm_rho: 7.0
+edm_num_inference_steps: 80
+edm_solver: "heun"
+edm_scaling: "boundary" # "boundary" or "no_boundary"
+edm_timestep_scale: "log" # "log", "raw", or "normalized"
+edm_data_std: 0.5
+edm_p_mean: -1.2
+edm_p_std: 1.2
+edm_weighting: "karras" # "karras" or "none"
+edm_loss_delta: -1.0
+edm_clip_train_sigma: false
+edm_clip_sample: true
+edm_initial_noise_scale: 1.0
+edm_loss_scale: 1.0
+
+# Consistency Policy student.
+# Uses a frozen EDM teacher plus student EMA targets.
+cp_bins: 80
+cp_ode_steps_max: 1
+cp_ctm_weight: 1.0
+cp_dsm_weight: 1.0
+cp_dsm_weighting: "karras" # "karras" or "none"
+cp_loss_delta: -1.0
+cp_clip_sample: true
+cp_initial_noise_scale: 1.0
+cp_teacher_path: null
+cp_teacher_auto_find: true
+cp_teacher_loss_type: "edm"
+cp_teacher_seed: 0
+cp_teacher_use_ema: true
+cp_teacher_required: true
+cp_teacher_missing: "error" # "error", "ignore", or "train"
+cp_teacher_gradient_steps: 300000
+cp_teacher_auto_resume: true
+cp_teacher_strict: true
+cp_warm_start_from_teacher: true
+checkpoint_task_id: null
+
 # MP1 / MeanFlow policy baseline.
 # This is the loss/sampler-only variant: no hidden-feature dispersive loss.
 mp1_flow_ratio: 0.5

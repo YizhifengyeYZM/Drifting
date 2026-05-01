@@ -169,7 +169,10 @@ class FlowMap(nn.Module):
 
     def get_velocity(self, t, xs, label, slot_noise_levels=None):
         """Get the velocity field of the flow."""
-        bt, _ = self.net(xs, t, t, label, slot_noise_levels=slot_noise_levels)
+        if slot_noise_levels is None:
+            bt, _ = self.net(xs, t, t, label)
+        else:
+            bt, _ = self.net(xs, t, t, label, slot_noise_levels=slot_noise_levels)
         return bt
 
     def get_reference_velocity(self, t, xs, label):

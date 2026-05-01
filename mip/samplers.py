@@ -15,9 +15,12 @@ from mip.torch_utils import at_least_ndim
 ##!! BPv3
 import math
 from mip.losses import (
+    cp_denoise,
     dp_ddpm_step,
     dp_get_schedule,
     dp_model_timestep,
+    edm_denoise,
+    edm_karras_sigmas,
     generate_ou_noise,
     mp1_interval_velocity,
 )
@@ -29,6 +32,10 @@ def get_default_step_list(loss_type: str):
     elif loss_type == "bridge":
         return [16]
     elif loss_type in ["regression", "mip", "tsd", "straight_flow"]:
+        return [1]
+    elif loss_type == "edm":
+        return [80]
+    elif loss_type == "cp":
         return [1]
     elif loss_type == "mp1":
         return [1]
@@ -107,6 +114,10 @@ def get_sampler(loss_type: str):
         return mip_sampler
     elif loss_type in ["dp", "ddpm"]:
         return dp_sampler
+    elif loss_type == "edm":
+        return edm_sampler
+    elif loss_type == "cp":
+        return cp_sampler
     elif loss_type == "mp1":
         return mp1_sampler
     elif loss_type == "naive_drift":
@@ -332,6 +343,97 @@ def dp_sampler(
         )
 
     return sample
+
+
+def edm_sampler(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    act_0: torch.Tensor,
+    obs: torch.Tensor,
+):
+    """EDM teacher sampler with Karras schedule and Heun updates."""
+    obs_emb = encoder(obs, None)
+    batch_size = act_0.shape[0]
+    configured_steps = int(getattr(config, "edm_num_inference_steps", 80))
+    num_steps = int(getattr(config, "num_steps", configured_steps))
+    if num_steps <= 1 and configured_steps > 1:
+        num_steps = configured_steps
+    num_steps = max(2, num_steps)
+
+    noise_scale = float(getattr(config, "edm_initial_noise_scale", 1.0))
+    sample = torch.randn_like(act_0, device=act_0.device) * noise_scale
+    sigmas = edm_karras_sigmas(
+        config,
+        num_steps=num_steps,
+        device=act_0.device,
+        dtype=act_0.dtype,
+    )
+    solver = str(getattr(config, "edm_solver", "heun"))
+    clamp = bool(getattr(config, "edm_clip_sample", True))
+
+    for sigma_scalar, next_sigma_scalar in zip(sigmas[:-1], sigmas[1:], strict=False):
+        sigma = sigma_scalar.expand(batch_size)
+        next_sigma = next_sigma_scalar.expand(batch_size)
+        denoised = edm_denoise(config, flow_map, sample, sigma, obs_emb, clamp=clamp)
+        d = (sample - denoised) / sigma.view(batch_size, *((1,) * (sample.ndim - 1)))
+        step = (next_sigma_scalar - sigma_scalar).to(sample.dtype)
+        euler_sample = sample + step * d
+
+        if solver in ["euler", "first_order"]:
+            sample = euler_sample
+        elif solver in ["heun", "second_order"]:
+            denoised_next = edm_denoise(
+                config,
+                flow_map,
+                euler_sample,
+                next_sigma,
+                obs_emb,
+                clamp=clamp,
+            )
+            d_next = (euler_sample - denoised_next) / next_sigma.view(
+                batch_size, *((1,) * (sample.ndim - 1))
+            )
+            sample = sample + step * (d + d_next) / 2.0
+        else:
+            raise NotImplementedError(f"EDM solver {solver} not implemented.")
+
+    return sample
+
+
+def cp_sampler(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    act_0: torch.Tensor,
+    obs: torch.Tensor,
+):
+    """Consistency Policy one-step sampler from sigma_max to sigma_min."""
+    obs_emb = encoder(obs, None)
+    batch_size = act_0.shape[0]
+    sigma_max = torch.full(
+        (batch_size,),
+        float(getattr(config, "edm_sigma_max", 80.0)),
+        device=act_0.device,
+        dtype=act_0.dtype,
+    )
+    sigma_min = torch.full(
+        (batch_size,),
+        float(getattr(config, "edm_sigma_min", 0.02)),
+        device=act_0.device,
+        dtype=act_0.dtype,
+    )
+    noise_scale = float(getattr(config, "cp_initial_noise_scale", 1.0))
+    sample = torch.randn_like(act_0, device=act_0.device) * noise_scale
+    return cp_denoise(
+        config,
+        flow_map,
+        sample,
+        sigma_max,
+        sigma_min,
+        obs_emb,
+        clamp=bool(getattr(config, "cp_clip_sample", True)),
+    )
 
 
 def mp1_sampler(

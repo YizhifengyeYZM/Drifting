@@ -52,6 +52,10 @@ def get_loss_fn(loss_type: str) -> Callable:
         return esd_loss
     elif loss_type == "mf":
         return mf_loss
+    elif loss_type == "edm":
+        return edm_loss
+    elif loss_type == "cp":
+        return cp_loss
     elif loss_type == "mp1":
         return mp1_loss
     elif loss_type == "bridge":
@@ -691,6 +695,473 @@ def dp_loss(
         "dp_timestep_mean": timesteps.float().mean().detach(),
         "dp_loss_scale": torch.as_tensor(loss_scale, device=act.device, dtype=act.dtype),
     }
+
+
+def _edm_append_dims(x: torch.Tensor, target_ndim: int) -> torch.Tensor:
+    while x.ndim < target_ndim:
+        x = x.unsqueeze(-1)
+    return x
+
+
+def edm_model_timestep(
+    config: OptimizationConfig,
+    sigma: torch.Tensor,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    sigma = sigma.clamp_min(1e-44)
+    mode = str(getattr(config, "edm_timestep_scale", "log"))
+    if mode == "log":
+        t = 250.0 * torch.log(sigma)
+    elif mode == "raw":
+        t = sigma
+    elif mode == "normalized":
+        sigma_min = float(getattr(config, "edm_sigma_min", 0.02))
+        sigma_max = float(getattr(config, "edm_sigma_max", 80.0))
+        t = (sigma - sigma_min) / max(sigma_max - sigma_min, 1e-12)
+    else:
+        raise NotImplementedError(f"EDM timestep scale {mode} not implemented.")
+    return t.to(dtype=dtype) if dtype is not None else t
+
+
+def edm_get_scalings(
+    config: OptimizationConfig,
+    sigma: torch.Tensor,
+    target_ndim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    data_std = torch.as_tensor(
+        float(getattr(config, "edm_data_std", 0.5)),
+        device=sigma.device,
+        dtype=sigma.dtype,
+    )
+    sigma_min = torch.as_tensor(
+        float(getattr(config, "edm_sigma_min", 0.02)),
+        device=sigma.device,
+        dtype=sigma.dtype,
+    )
+    scaling = str(getattr(config, "edm_scaling", "boundary"))
+    if scaling == "boundary":
+        c_skip = data_std**2 / ((sigma - sigma_min) ** 2 + data_std**2)
+        c_out = (sigma - sigma_min) * data_std / torch.sqrt(sigma**2 + data_std**2)
+    elif scaling == "no_boundary":
+        c_skip = data_std**2 / (sigma**2 + data_std**2)
+        c_out = sigma * data_std / torch.sqrt(sigma**2 + data_std**2)
+    else:
+        raise NotImplementedError(f"EDM scaling {scaling} not implemented.")
+    c_in = 1.0 / torch.sqrt(sigma**2 + data_std**2)
+    return (
+        _edm_append_dims(c_skip, target_ndim),
+        _edm_append_dims(c_out, target_ndim),
+        _edm_append_dims(c_in, target_ndim),
+    )
+
+
+def edm_denoise(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    sample: torch.Tensor,
+    sigma: torch.Tensor,
+    obs_emb: torch.Tensor,
+    clamp: bool = False,
+) -> torch.Tensor:
+    if sigma.ndim == 0:
+        sigma = sigma.expand(sample.shape[0])
+    elif sigma.numel() == 1:
+        sigma = sigma.reshape(1).expand(sample.shape[0])
+    sigma = sigma.to(device=sample.device, dtype=sample.dtype)
+    c_skip, c_out, c_in = edm_get_scalings(config, sigma, sample.ndim)
+    t_model = edm_model_timestep(config, sigma, dtype=sample.dtype)
+    model_out = flow_map.get_velocity(t_model, sample * c_in, obs_emb)
+    denoised = model_out * c_out + sample * c_skip
+    if clamp:
+        denoised = denoised.clamp(-1.0, 1.0)
+    return denoised
+
+
+def edm_karras_sigmas(
+    config: OptimizationConfig,
+    num_steps: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    sigma_min = float(getattr(config, "edm_sigma_min", 0.02))
+    sigma_max = float(getattr(config, "edm_sigma_max", 80.0))
+    rho = float(getattr(config, "edm_rho", 7.0))
+    ramp = torch.linspace(0, 1, num_steps, device=device, dtype=dtype)
+    min_inv_rho = sigma_min ** (1.0 / rho)
+    max_inv_rho = sigma_max ** (1.0 / rho)
+    return (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** rho
+
+
+def edm_sample_sigma(
+    config: OptimizationConfig,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    p_mean = float(getattr(config, "edm_p_mean", -1.2))
+    p_std = float(getattr(config, "edm_p_std", 1.2))
+    sigma = (torch.randn(batch_size, device=device, dtype=dtype) * p_std + p_mean).exp()
+    if bool(getattr(config, "edm_clip_train_sigma", False)):
+        sigma_min = float(getattr(config, "edm_sigma_min", 0.02))
+        sigma_max = float(getattr(config, "edm_sigma_max", 80.0))
+        sigma = sigma.clamp(sigma_min, sigma_max)
+    return sigma
+
+
+def edm_karras_weight(
+    config: OptimizationConfig,
+    sigma: torch.Tensor,
+) -> torch.Tensor | None:
+    weighting = str(getattr(config, "edm_weighting", "karras"))
+    if weighting == "none":
+        return None
+    if weighting != "karras":
+        raise NotImplementedError(f"EDM weighting {weighting} not implemented.")
+    data_std = torch.as_tensor(
+        float(getattr(config, "edm_data_std", 0.5)),
+        device=sigma.device,
+        dtype=sigma.dtype,
+    )
+    return (sigma**2 + data_std**2) / ((sigma * data_std) ** 2)
+
+
+def edm_pseudo_huber_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    delta: float = -1.0,
+    weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if delta == -1:
+        delta = math.sqrt(math.prod(pred.shape[1:])) * 0.00054
+    sq_error = (pred - target).pow(2)
+    if delta == 0:
+        loss = sq_error
+    else:
+        delta_tensor = torch.as_tensor(delta, device=pred.device, dtype=pred.dtype)
+        loss = torch.sqrt(sq_error.pow(2) + delta_tensor**2) - delta_tensor
+    if weights is not None:
+        loss = loss * _edm_append_dims(weights, pred.ndim)
+    return loss.mean()
+
+
+def edm_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+) -> float:
+    """EDM teacher loss used by Consistency Policy."""
+    del interp, delta_t
+    obs_emb = encoder(obs, None)
+    batch_size = act.shape[0]
+    sigma = edm_sample_sigma(config, batch_size, act.device, act.dtype)
+    noisy_act = act + _edm_append_dims(sigma, act.ndim) * torch.randn_like(act)
+    pred = edm_denoise(config, flow_map, noisy_act, sigma, obs_emb, clamp=False)
+    weights = edm_karras_weight(config, sigma)
+    raw_loss = edm_pseudo_huber_loss(
+        pred,
+        act,
+        delta=float(getattr(config, "edm_loss_delta", -1.0)),
+        weights=weights,
+    )
+    loss_scale = float(getattr(config, "edm_loss_scale", 1.0))
+    loss = loss_scale * raw_loss
+    mse = F.mse_loss(pred.detach(), act.detach())
+    return loss, {
+        "edm_loss": raw_loss.detach(),
+        "edm_mse": mse,
+        "edm_sigma_mean": sigma.detach().mean(),
+        "edm_sigma_max": sigma.detach().max(),
+        "edm_loss_scale": torch.as_tensor(loss_scale, device=act.device, dtype=act.dtype),
+    }
+
+
+def cp_timesteps_to_sigmas(
+    config: OptimizationConfig,
+    timesteps: torch.Tensor,
+) -> torch.Tensor:
+    """Map CP/CTM bin indices to Karras sigmas."""
+    sigma_min = float(getattr(config, "edm_sigma_min", 0.02))
+    sigma_max = float(getattr(config, "edm_sigma_max", 80.0))
+    rho = float(getattr(config, "edm_rho", 7.0))
+    bins = int(getattr(config, "cp_bins", getattr(config, "edm_num_inference_steps", 80)))
+    denom = max(bins - 1, 1)
+    t = timesteps.to(dtype=torch.float32)
+    sigmas = sigma_max ** (1.0 / rho) + t / denom * (
+        sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho)
+    )
+    sigmas = sigmas**rho
+    return sigmas.clamp(sigma_min, sigma_max).to(device=timesteps.device)
+
+
+def cp_sample_ctm_bins(
+    config: OptimizationConfig,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Official CP CTM sampler: t <= u <= s in Karras bin space."""
+    bins = int(getattr(config, "cp_bins", getattr(config, "edm_num_inference_steps", 80)))
+    ode_steps_max = int(getattr(config, "cp_ode_steps_max", 1))
+    t_idx = torch.randint(0, bins, (batch_size,), device=device, dtype=torch.long)
+
+    s_span = (bins - t_idx + 1).clamp_min(1)
+    s_idx = t_idx + torch.floor(torch.rand(batch_size, device=device) * s_span).long()
+
+    u_span = (s_idx - t_idx + 1).clamp_min(1)
+    u_idx = t_idx + torch.floor(torch.rand(batch_size, device=device) * u_span).long()
+    u_idx = torch.minimum(u_idx, t_idx + ode_steps_max)
+    return t_idx, s_idx, u_idx
+
+
+def cp_denoise(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    sample: torch.Tensor,
+    sigma: torch.Tensor,
+    stop_sigma: torch.Tensor,
+    obs_emb: torch.Tensor,
+    clamp: bool = False,
+) -> torch.Tensor:
+    """CTM/CP G_theta(x_sigma, sigma, stop_sigma | obs)."""
+    if sigma.ndim == 0:
+        sigma = sigma.expand(sample.shape[0])
+    elif sigma.numel() == 1:
+        sigma = sigma.reshape(1).expand(sample.shape[0])
+    if stop_sigma.ndim == 0:
+        stop_sigma = stop_sigma.expand(sample.shape[0])
+    elif stop_sigma.numel() == 1:
+        stop_sigma = stop_sigma.reshape(1).expand(sample.shape[0])
+
+    sigma = sigma.to(device=sample.device, dtype=sample.dtype)
+    stop_sigma = stop_sigma.to(device=sample.device, dtype=sample.dtype)
+    c_skip, c_out, c_in = edm_get_scalings(config, sigma, sample.ndim)
+    sigma_model = edm_model_timestep(config, sigma, dtype=sample.dtype)
+    stop_model = edm_model_timestep(config, stop_sigma, dtype=sample.dtype)
+    model_out, _ = flow_map.net(sample * c_in, sigma_model, stop_model, obs_emb)
+    denoised = model_out * c_out + sample * c_skip
+
+    ratio = _edm_append_dims(
+        stop_sigma / sigma.clamp_min(torch.finfo(sample.dtype).tiny),
+        sample.ndim,
+    )
+    out = sample * ratio + denoised * (1.0 - ratio)
+    if clamp:
+        out = out.clamp(-1.0, 1.0)
+    return out
+
+
+@torch.no_grad()
+def cp_teacher_heun_to_u(
+    config: OptimizationConfig,
+    teacher_flow_map: FlowMap,
+    sample: torch.Tensor,
+    t_idx: torch.Tensor,
+    u_idx: torch.Tensor,
+    obs_emb: torch.Tensor,
+) -> torch.Tensor:
+    """Integrate the frozen EDM teacher from CP bin t to bin u."""
+    y = sample
+    ode_steps_max = int(getattr(config, "cp_ode_steps_max", 1))
+    batch_size = sample.shape[0]
+    view_shape = (batch_size, *((1,) * (sample.ndim - 1)))
+    tiny = torch.finfo(sample.dtype).tiny
+
+    for d in range(ode_steps_max):
+        current_idx = torch.minimum(
+            torch.maximum(t_idx + d, t_idx),
+            u_idx,
+        )
+        next_idx = torch.minimum(
+            torch.maximum(t_idx + d + 1, t_idx),
+            u_idx,
+        )
+        sigma = cp_timesteps_to_sigmas(config, current_idx).to(
+            device=sample.device, dtype=sample.dtype
+        )
+        next_sigma = cp_timesteps_to_sigmas(config, next_idx).to(
+            device=sample.device, dtype=sample.dtype
+        )
+        step = (next_sigma - sigma).view(view_shape)
+        same = (next_idx == current_idx).view(view_shape)
+
+        denoised = edm_denoise(config, teacher_flow_map, y, sigma, obs_emb, clamp=False)
+        d_cur = (y - denoised) / sigma.clamp_min(tiny).view(view_shape)
+        y_euler = y + step * d_cur
+
+        denoised_next = edm_denoise(
+            config,
+            teacher_flow_map,
+            y_euler,
+            next_sigma,
+            obs_emb,
+            clamp=False,
+        )
+        d_next = (y_euler - denoised_next) / next_sigma.clamp_min(tiny).view(view_shape)
+        y_next = y + step * (d_cur + d_next) / 2.0
+        y = torch.where(same, y, y_next)
+
+    return y
+
+
+def cp_sample_dsm_sigma(
+    config: OptimizationConfig,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Official CP DSM sampler: half CTM-biased Karras, half lognormal."""
+    n_ctm = (batch_size + 1) // 2
+    n_ln = batch_size - n_ctm
+    sigma_min = float(getattr(config, "edm_sigma_min", 0.02))
+    sigma_max = float(getattr(config, "edm_sigma_max", 80.0))
+    rho = float(getattr(config, "edm_rho", 7.0))
+
+    xi = torch.rand(n_ctm, device=device, dtype=dtype) * 0.7
+    ctm_sigma = (
+        sigma_max ** (1.0 / rho)
+        + xi * (sigma_min ** (1.0 / rho) - sigma_max ** (1.0 / rho))
+    ) ** rho
+    ctm_sigma = ctm_sigma.clamp(sigma_min, sigma_max)
+
+    if n_ln > 0:
+        lognormal_sigma = edm_sample_sigma(config, n_ln, device, dtype)
+        sigma = torch.cat([ctm_sigma, lognormal_sigma], dim=0)
+    else:
+        sigma = ctm_sigma
+    return sigma
+
+
+def cp_loss(
+    config: OptimizationConfig,
+    flow_map: FlowMap,
+    encoder: BaseEncoder,
+    interp: Interpolant,
+    act: torch.Tensor,
+    obs: torch.Tensor,
+    delta_t: torch.Tensor,
+    flow_map_ema: FlowMap | None = None,
+    encoder_ema: BaseEncoder | None = None,
+    teacher_flow_map: FlowMap | None = None,
+    teacher_encoder: BaseEncoder | None = None,
+) -> float:
+    """Consistency Policy loss: CTM distillation plus DSM."""
+    del interp, delta_t
+    ctm_weight = float(getattr(config, "cp_ctm_weight", 1.0))
+    dsm_weight = float(getattr(config, "cp_dsm_weight", 1.0))
+    if ctm_weight > 0 and teacher_flow_map is None:
+        raise RuntimeError("CP loss requires a frozen EDM teacher for the CTM term.")
+    if flow_map_ema is None or encoder_ema is None:
+        raise RuntimeError("CP loss requires student EMA models.")
+
+    obs_emb = encoder(obs, None)
+    with torch.no_grad():
+        obs_emb_ema = encoder_ema(obs, None)
+        obs_emb_teacher = (
+            teacher_encoder(obs, None) if teacher_encoder is not None else obs_emb_ema
+        )
+
+    batch_size = act.shape[0]
+    sigma_min = torch.full(
+        (batch_size,),
+        float(getattr(config, "edm_sigma_min", 0.02)),
+        device=act.device,
+        dtype=act.dtype,
+    )
+    delta = float(getattr(config, "cp_loss_delta", -1.0))
+    aux = {}
+    total = act.new_tensor(0.0)
+
+    if ctm_weight > 0:
+        t_idx, s_idx, u_idx = cp_sample_ctm_bins(config, batch_size, act.device)
+        sigma_t = cp_timesteps_to_sigmas(config, t_idx).to(device=act.device, dtype=act.dtype)
+        sigma_s = cp_timesteps_to_sigmas(config, s_idx).to(device=act.device, dtype=act.dtype)
+        sigma_u = cp_timesteps_to_sigmas(config, u_idx).to(device=act.device, dtype=act.dtype)
+
+        noise_traj = act + _edm_append_dims(sigma_t, act.ndim) * torch.randn_like(act)
+        u_noise_traj = cp_teacher_heun_to_u(
+            config,
+            teacher_flow_map,
+            noise_traj,
+            t_idx,
+            u_idx,
+            obs_emb_teacher,
+        )
+
+        pred = cp_denoise(
+            config, flow_map, noise_traj, sigma_t, sigma_s, obs_emb, clamp=False
+        )
+        with torch.no_grad():
+            target = cp_denoise(
+                config,
+                flow_map_ema,
+                u_noise_traj,
+                sigma_u,
+                sigma_s,
+                obs_emb_ema,
+                clamp=False,
+            )
+
+        pred_to_min = cp_denoise(
+            config,
+            flow_map_ema,
+            pred,
+            sigma_s,
+            sigma_min,
+            obs_emb_ema,
+            clamp=False,
+        )
+        with torch.no_grad():
+            target_to_min = cp_denoise(
+                config,
+                flow_map_ema,
+                target,
+                sigma_s,
+                sigma_min,
+                obs_emb_ema,
+                clamp=False,
+            )
+
+        ctm_raw = edm_pseudo_huber_loss(pred_to_min, target_to_min, delta=delta)
+        total = total + ctm_weight * ctm_raw
+        aux.update(
+            {
+                "cp_ctm_loss": ctm_raw.detach(),
+                "cp_t_sigma_mean": sigma_t.detach().mean(),
+                "cp_s_sigma_mean": sigma_s.detach().mean(),
+                "cp_u_sigma_mean": sigma_u.detach().mean(),
+            }
+        )
+
+    if dsm_weight > 0:
+        sigma = cp_sample_dsm_sigma(config, batch_size, act.device, act.dtype)
+        noisy_act = act + _edm_append_dims(sigma, act.ndim) * torch.randn_like(act)
+        pred = cp_denoise(
+            config, flow_map, noisy_act, sigma, sigma_min, obs_emb, clamp=False
+        )
+        weighting = str(getattr(config, "cp_dsm_weighting", "karras"))
+        weights = edm_karras_weight(config, sigma) if weighting == "karras" else None
+        if weighting not in ["karras", "none"]:
+            raise NotImplementedError(f"CP DSM weighting {weighting} not implemented.")
+        dsm_raw = edm_pseudo_huber_loss(pred, act, delta=delta, weights=weights)
+        total = total + dsm_weight * dsm_raw
+        aux.update(
+            {
+                "cp_dsm_loss": dsm_raw.detach(),
+                "cp_dsm_sigma_mean": sigma.detach().mean(),
+            }
+        )
+
+    aux.update(
+        {
+            "cp_loss": total.detach(),
+            "cp_ctm_weight": torch.as_tensor(ctm_weight, device=act.device, dtype=act.dtype),
+            "cp_dsm_weight": torch.as_tensor(dsm_weight, device=act.device, dtype=act.dtype),
+        }
+    )
+    return total, aux
 
 
 def mp1_interval_velocity(

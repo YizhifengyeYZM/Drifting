@@ -46,6 +46,8 @@ class TrainingAgent:
         report_parameters(self.encoder, model_name="Encoder Network")
         self.encoder_ema = deepcopy(self.encoder).requires_grad_(False)
         self.flow_map_ema = deepcopy(self.flow_map).requires_grad_(False)
+        self.teacher_encoder = None
+        self.teacher_flow_map = None
 
         # Create detached models for CUDA graphs (if enabled)
         self.use_cudagraphs = config.optimization.use_cudagraphs
@@ -215,15 +217,30 @@ class TrainingAgent:
             delta_t = data["delta_t"]
 
             # Forward pass and compute loss
-            loss, loss_aux = self.loss_fn(
-                self.config.optimization,
-                self.flow_map,
-                self.encoder,
-                self.interpolant,
-                act,
-                obs,
-                delta_t,
-            )
+            if self.config.optimization.loss_type == "cp":
+                loss, loss_aux = self.loss_fn(
+                    self.config.optimization,
+                    self.flow_map,
+                    self.encoder,
+                    self.interpolant,
+                    act,
+                    obs,
+                    delta_t,
+                    self.flow_map_ema,
+                    self.encoder_ema,
+                    self.teacher_flow_map,
+                    self.teacher_encoder,
+                )
+            else:
+                loss, loss_aux = self.loss_fn(
+                    self.config.optimization,
+                    self.flow_map,
+                    self.encoder,
+                    self.interpolant,
+                    act,
+                    obs,
+                    delta_t,
+                )
 
             # Backward pass
             loss.backward()
@@ -462,12 +479,58 @@ class TrainingAgent:
 
         return training_state
 
+    def load_consistency_teacher(
+        self,
+        path: str,
+        use_ema: bool = True,
+        warm_start: bool = True,
+        strict: bool = True,
+    ):
+        """Load a frozen EDM teacher for Consistency Policy training.
+
+        Args:
+            path: Checkpoint path.
+            use_ema: Load EMA weights from the teacher checkpoint when available.
+            warm_start: Initialize the online student and student EMA from teacher.
+            strict: Strict state-dict loading.
+        """
+        state_dict = torch.load(
+            path, map_location=self.config.optimization.device, weights_only=False
+        )
+        flow_key = "flow_map_ema" if use_ema and "flow_map_ema" in state_dict else "flow_map"
+        enc_key = "encoder_ema" if use_ema and "encoder_ema" in state_dict else "encoder"
+
+        self.teacher_flow_map = deepcopy(self.flow_map).to(
+            self.config.optimization.device
+        )
+        self.teacher_encoder = deepcopy(self.encoder).to(self.config.optimization.device)
+        self.teacher_flow_map.load_state_dict(state_dict[flow_key], strict=strict)
+        self.teacher_encoder.load_state_dict(state_dict[enc_key], strict=strict)
+        self.teacher_flow_map.eval().requires_grad_(False)
+        self.teacher_encoder.eval().requires_grad_(False)
+        loguru.logger.info(
+            f"Loaded CP teacher from {path} using keys {flow_key}/{enc_key}"
+        )
+
+        if warm_start:
+            self.flow_map.load_state_dict(state_dict[flow_key], strict=strict)
+            self.encoder.load_state_dict(state_dict[enc_key], strict=strict)
+            self.flow_map_ema.load_state_dict(state_dict[flow_key], strict=strict)
+            self.encoder_ema.load_state_dict(state_dict[enc_key], strict=strict)
+            loguru.logger.info("Warm-started CP student from teacher checkpoint")
+
+        self.__compile__()
+
     def eval(self):
         """Set all models to evaluation mode."""
         self.flow_map.eval()
         self.encoder.eval()
         self.flow_map_ema.eval()
         self.encoder_ema.eval()
+        if self.teacher_flow_map is not None:
+            self.teacher_flow_map.eval()
+        if self.teacher_encoder is not None:
+            self.teacher_encoder.eval()
 
     def train(self):
         """Set all models to training mode."""
@@ -475,3 +538,7 @@ class TrainingAgent:
         self.encoder.train()
         self.flow_map_ema.train()
         self.encoder_ema.train()
+        if self.teacher_flow_map is not None:
+            self.teacher_flow_map.eval()
+        if self.teacher_encoder is not None:
+            self.teacher_encoder.eval()

@@ -4,6 +4,7 @@ Author: Chaoyi Pan
 Date: 2025-10-03
 """
 
+from copy import deepcopy
 import os
 import time
 from contextlib import contextmanager
@@ -21,6 +22,12 @@ os.environ["MUJOCO_GL"] = "osmesa"  # noqa: E402
 # Import mip modules after setting environment variables
 from mip.action_utils import action_rel_to_abs, get_eef_state_from_obs  # noqa: E402
 from mip.agent import TrainingAgent  # noqa: E402
+from mip.checkpoint_utils import (  # noqa: E402
+    build_checkpoint_base_name,
+    candidate_checkpoint_base_names,
+    find_first_checkpoint,
+    resolve_cp_teacher_checkpoint,
+)
 from mip.config import Config  # noqa: E402
 from mip.dataset_utils import loop_dataloader  # noqa: E402
 from mip.datasets.robomimic_dataset import make_dataset  # noqa: E402
@@ -234,11 +241,7 @@ def train(config: Config, envs, dataset, agent, logger, resume_state=None):
 
                     # Save to global checkpoints directory with success rate comparison
                     # Include training state for resuming
-                    checkpoint_base_name = (
-                        f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-                        f"{config.optimization.loss_type}_{config.network.network_type}_"
-                        f"{config.network.emb_dim}_seed{config.optimization.seed}"
-                    )
+                    checkpoint_base_name = build_checkpoint_base_name(config)
                     training_state = {
                         "n_gradient_step": n_gradient_step,
                         "best_metrics": best_metrics,
@@ -484,6 +487,83 @@ def eval(config: Config, envs, dataset, agent, logger, num_steps=1):
     return metrics
 
 
+def ensure_cp_teacher_checkpoint(config, envs, dataset):
+    """Optionally train the shared seed-0 EDM teacher before CP student training."""
+    if config.mode != "train" or config.optimization.loss_type != "cp":
+        return None
+
+    teacher_path = resolve_cp_teacher_checkpoint(config, logger=None)
+    if teacher_path is not None:
+        return teacher_path
+
+    if str(config.optimization.cp_teacher_missing) != "train":
+        return None
+
+    teacher_config = deepcopy(config)
+    teacher_config.optimization.loss_type = config.optimization.cp_teacher_loss_type
+    teacher_config.optimization.seed = int(config.optimization.cp_teacher_seed)
+    teacher_config.optimization.gradient_steps = int(
+        config.optimization.cp_teacher_gradient_steps
+    )
+    teacher_config.optimization.auto_resume = bool(
+        config.optimization.cp_teacher_auto_resume
+    )
+    teacher_config.optimization.model_path = None
+    teacher_config.log.exp_name = (
+        f"{config.log.exp_name}_teacher_seed{teacher_config.optimization.seed}"
+    )
+
+    loguru.logger.info(
+        "Training CP teacher first: "
+        f"loss={teacher_config.optimization.loss_type}, "
+        f"seed={teacher_config.optimization.seed}, "
+        f"steps={teacher_config.optimization.gradient_steps}"
+    )
+    set_seed(teacher_config.optimization.seed)
+    teacher_logger = Logger(teacher_config)
+    teacher_agent = TrainingAgent(teacher_config)
+    teacher_resume_state = None
+    if teacher_config.optimization.auto_resume:
+        checkpoint_path, _ = find_first_checkpoint(
+            teacher_logger, candidate_checkpoint_base_names(teacher_config)
+        )
+        if checkpoint_path is not None:
+            loguru.logger.info(f"Resuming CP teacher from {checkpoint_path}")
+            teacher_resume_state = teacher_agent.load(
+                str(checkpoint_path), load_optimizer=True
+            )
+
+    try:
+        train(
+            teacher_config,
+            envs,
+            dataset,
+            teacher_agent,
+            teacher_logger,
+            resume_state=teacher_resume_state,
+        )
+
+        teacher_path = resolve_cp_teacher_checkpoint(config, logger=teacher_logger)
+        if teacher_path is None:
+            checkpoint_base_name = build_checkpoint_base_name(teacher_config)
+            teacher_logger.save_global_checkpoint(
+                teacher_agent,
+                checkpoint_base_name,
+                success_rate=0.0,
+                training_state={
+                    "n_gradient_step": teacher_config.optimization.gradient_steps - 1,
+                    "best_metrics": {},
+                    "eval_history": [],
+                },
+            )
+            teacher_path = resolve_cp_teacher_checkpoint(config, logger=teacher_logger)
+    finally:
+        teacher_logger.finish(None)
+
+    set_seed(config.optimization.seed)
+    return teacher_path
+
+
 @hydra.main(version_base=None, config_path="configs/", config_name="main")
 def main(config):
     """Main pipeline function that calls the appropriate standalone function based on mode."""
@@ -497,8 +577,6 @@ def main(config):
     # general config setup
     set_seed(config.optimization.seed)
     limit_threads(1)
-    logger = Logger(config)
-    loguru.logger.info("Finished setting up logger")
 
     # post process config
     if config.network.network_type == "chiunet":
@@ -524,6 +602,10 @@ def main(config):
     dataset = make_dataset(config.task)
     loguru.logger.info("Finished setting up dataset")
 
+    ensure_cp_teacher_checkpoint(config, envs, dataset)
+
+    logger = Logger(config)
+    loguru.logger.info("Finished setting up logger")
     agent = TrainingAgent(config)
     resume_state = None
 
@@ -532,12 +614,9 @@ def main(config):
         resume_state = agent.load(config.optimization.model_path, load_optimizer=True)
     elif config.optimization.auto_resume:
         # Automatically look for checkpoint to resume from
-        checkpoint_base_name = (
-            f"{config.task.env_name}_{config.task.env_type}_{config.task.obs_type}_"
-            f"{config.optimization.loss_type}_{config.network.network_type}_"
-            f"{config.network.emb_dim}_seed{config.optimization.seed}"
+        checkpoint_path, checkpoint_base_name = find_first_checkpoint(
+            logger, candidate_checkpoint_base_names(config)
         )
-        checkpoint_path = logger.find_latest_checkpoint(checkpoint_base_name)
         if checkpoint_path:
             loguru.logger.info(f"Found checkpoint to resume from: {checkpoint_path}")
             loguru.logger.info("Loading checkpoint with optimizer state...")
@@ -546,6 +625,23 @@ def main(config):
             loguru.logger.info("No checkpoint found, starting training from scratch")
     elif config.mode == "train" and not config.optimization.auto_resume:
         loguru.logger.info("Auto-resume disabled, starting training from scratch")
+
+    if config.mode == "train" and config.optimization.loss_type == "cp":
+        teacher_path = resolve_cp_teacher_checkpoint(config, logger)
+        if teacher_path is not None:
+            agent.load_consistency_teacher(
+                str(teacher_path),
+                use_ema=config.optimization.cp_teacher_use_ema,
+                warm_start=(
+                    config.optimization.cp_warm_start_from_teacher
+                    and resume_state is None
+                    and not (
+                        config.optimization.model_path
+                        and config.optimization.model_path != "None"
+                    )
+                ),
+                strict=config.optimization.cp_teacher_strict,
+            )
 
     if config.mode == "train":
         train(config, envs, dataset, agent, logger, resume_state=resume_state)
