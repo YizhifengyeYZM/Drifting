@@ -34,24 +34,34 @@ from mip.datasets.imagecodecs import register_codecs
 register_codecs()
 
 
+def _get_config_value(task_config, name):
+    value = getattr(task_config, name, None)
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return value
+
+
 def make_dataset(task_config, mode="train"):
-    # Check if we should download from HuggingFace
-    if hasattr(task_config, "dataset_repo") and hasattr(
-        task_config, "dataset_filename"
-    ):
+    dataset_path = _get_config_value(task_config, "dataset_path")
+    dataset_repo = _get_config_value(task_config, "dataset_repo")
+    dataset_filename = _get_config_value(task_config, "dataset_filename")
+
+    if dataset_path is not None:
+        # Use explicit local paths first. This lets task YAMLs override a broken
+        # Hub file without changing the training command.
+        dataset_path = os.path.expanduser(dataset_path)
+        logger.info(f"Using local dataset: {dataset_path}")
+    elif dataset_repo is not None and dataset_filename is not None:
         # Auto-download from HuggingFace
         logger.info(
-            f"Downloading dataset from {task_config.dataset_repo}/{task_config.dataset_filename}"
+            f"Downloading dataset from {dataset_repo}/{dataset_filename}"
         )
         dataset_path = hf_hub_download(
-            repo_id=task_config.dataset_repo,
-            filename=task_config.dataset_filename,
+            repo_id=dataset_repo,
+            filename=dataset_filename,
             repo_type="dataset",
         )
         logger.info(f"Downloaded dataset to: {dataset_path}")
-    elif hasattr(task_config, "dataset_path"):
-        # Use explicit path if provided
-        dataset_path = os.path.expanduser(task_config.dataset_path)
     else:
         raise ValueError(
             "Either dataset_repo/dataset_filename or dataset_path must be provided"

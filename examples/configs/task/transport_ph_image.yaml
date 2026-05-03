@@ -10,9 +10,11 @@ env_type: "ph"
 # HuggingFace dataset configuration - auto-downloads from the repository
 dataset_filename: "robomimic/transport/ph/image_abs.hdf5"
 
-# Alternative: Use original repo with demo dataset (requires local processing)
-# dataset_repo: "amandlek/robomimic"
-# dataset_filename: "v1.5/transport/ph/demo_v15.hdf5"
+# Set this to the DP official extracted image_abs.hdf5 to bypass the broken
+# HuggingFace mirror for Transport Image while keeping launch commands unchanged.
+# Example after extracting robomimic_image.zip:
+# dataset_path: "/path/to/data/robomimic/datasets/transport/ph/image_abs.hdf5"
+dataset_path: "/2024233219/dataset/diffusion_policy/robomimic/datasets/transport/ph/image_abs.hdf5"
 
 max_episode_steps: 700
 render_obs_key: "shouldercamera0_image"

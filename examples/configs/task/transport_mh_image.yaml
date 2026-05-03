@@ -6,3 +6,7 @@ defaults:
 # Override for mh variant
 env_type: "mh"
 dataset_filename: "robomimic/transport/mh/image_abs.hdf5"
+
+# Example after extracting DP official robomimic_image.zip:
+# dataset_path: "/path/to/data/robomimic/datasets/transport/mh/image_abs.hdf5"
+dataset_path: null
